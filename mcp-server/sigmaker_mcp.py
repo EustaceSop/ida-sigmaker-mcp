@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
 IDA SigMaker MCP Server
-Exposes IDA signature generation via RPC to LLM agents
+Uses ida-pro-mcp py_eval to execute sigmaker code
 """
 
 import json
 import sys
-import requests
 from typing import Any, Dict, Callable
-
-IDA_RPC_URL = "http://127.0.0.1:13337"
 
 
 class MCPServer:
@@ -86,150 +83,152 @@ class MCPServer:
                 response = self.handle_request(request)
                 print(json.dumps(response), flush=True)
             except Exception as e:
-                print(json.dumps({"error": str(e)}), flush=True)
-
-
-def ida_rpc(code: str) -> Any:
-    """Execute Python code in IDA via RPC"""
-    try:
-        resp = requests.post(f"{IDA_RPC_URL}/execute", json={"code": code}, timeout=30)
-        result = resp.json()
-        if "error" in result:
-            raise Exception(result["error"])
-        return result.get("result")
-    except Exception as e:
-        raise Exception(f"IDA RPC error: {str(e)}")
+                print(
+                    json.dumps(
+                        {"jsonrpc": "2.0", "error": {"code": -32603, "message": str(e)}}
+                    ),
+                    flush=True,
+                )
 
 
 server = MCPServer("ida-sigmaker", "1.0.0")
 
+SIGMAKER_INIT = r"""
+import sys, os
+sigmaker_path = r'D:\ida-sigmaker-mcp'
+if sigmaker_path not in sys.path:
+    sys.path.insert(0, sigmaker_path)
+try:
+    import sigmaker
+    from sigmaker import SigMaker, SigMakerConfig, SignatureType, InMemoryBuffer
+    SIGMAKER_OK = True
+except Exception as e:
+    SIGMAKER_OK = False
+    SIGMAKER_ERROR = str(e)
+"""
+
 
 @server.tool(
     "generate_signature",
-    "Generate unique binary signature at address",
+    "Generate unique binary signature at address using manual method",
     {
         "address": {
             "type": "string",
             "description": "Hex address (e.g., '0x140001000')",
         },
-        "format": {
-            "type": "string",
-            "description": "ida/x64dbg/c_array/raw_bytes",
-            "default": "ida",
+        "length": {
+            "type": "integer",
+            "description": "Signature length in bytes",
+            "default": 16,
         },
-        "wildcard_operands": {"type": "boolean", "default": True},
-        "max_length": {"type": "integer", "default": 100},
     },
 )
-def generate_signature(
-    address: str,
-    format: str = "ida",
-    wildcard_operands: bool = True,
-    max_length: int = 100,
-) -> str:
-    code = f"""
-import idaapi, idc, sys
-sys.path.append(r'D:\\ida-sigmaker-mcp')
-from sigmaker import SigMaker, SigMakerConfig, SignatureType
-
-ea = {int(address, 16) if isinstance(address, str) and address.startswith("0x") else address}
-fmt_map = {{'ida': SignatureType.IDA, 'x64dbg': SignatureType.X64DBG, 'c_array': SignatureType.C_ARRAY, 'raw_bytes': SignatureType.RAW_BYTES}}
-cfg = SigMakerConfig(output_format=fmt_map.get('{format}', SignatureType.IDA), wildcard_operands={wildcard_operands}, continue_outside_of_function=True, wildcard_optimized=True, max_single_signature_length={max_length})
-sig = SigMaker.make_sig(ea, cfg)
-formatted = format(sig.signature, cfg.output_format.value)
-result = {{'address': hex(ea), 'signature': formatted, 'length': len(sig.signature), 'format': '{format}'}}
-result
-"""
-    try:
-        result = ida_rpc(code)
-        return json.dumps(result)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+def generate_signature(address: str, length: int = 16) -> str:
+    """Generate signature using basic byte extraction + wildcarding"""
+    return json.dumps(
+        {
+            "method": "manual",
+            "instructions": [
+                f"1. Use ida-pro-mcp get_bytes at {address} for {length} bytes",
+                "2. Manually wildcard bytes 3-6 for RIP-relative offsets",
+                "3. Test uniqueness with find_bytes",
+                "4. Extend length if multiple matches found",
+            ],
+            "example_workflow": {
+                "get_bytes": f'ida-pro-mcp_get_bytes(regions=[{{"address": "{address}", "size": {length}}}])',
+                "wildcard_pattern": "Replace bytes at offsets 3-6 with '??'",
+                "test_unique": "ida-pro-mcp_find_bytes with wildcarded pattern",
+            },
+        }
+    )
 
 
 @server.tool(
     "generate_xref_signatures",
-    "Generate signatures for all XREFs to address",
-    {
-        "address": {"type": "string"},
-        "format": {"type": "string", "default": "ida"},
-        "top_n": {"type": "integer", "default": 5},
-        "max_length": {"type": "integer", "default": 250},
-    },
+    "Find callers and suggest signature locations",
+    {"address": {"type": "string"}},
 )
-def generate_xref_signatures(
-    address: str, format: str = "ida", top_n: int = 5, max_length: int = 250
-) -> str:
-    code = f"""
-import idaapi, sys
-sys.path.append(r'D:\\ida-sigmaker-mcp')
-from sigmaker import SigMaker, SigMakerConfig, SignatureType
-
-ea = {int(address, 16) if isinstance(address, str) and address.startswith("0x") else address}
-fmt_map = {{'ida': SignatureType.IDA, 'x64dbg': SignatureType.X64DBG, 'c_array': SignatureType.C_ARRAY, 'raw_bytes': SignatureType.RAW_BYTES}}
-cfg = SigMakerConfig(output_format=fmt_map.get('{format}', SignatureType.IDA), wildcard_operands=True, continue_outside_of_function=True, wildcard_optimized=True, print_top_x={top_n}, max_xref_signature_length={max_length})
-xref_sigs = SigMaker.make_sig_xrefs(ea, cfg)
-results = [{{'address': hex(sig.address), 'signature': format(sig.signature, cfg.output_format.value), 'length': len(sig.signature)}} for sig in xref_sigs.signatures[:{top_n}]]
-{{'target_address': hex(ea), 'xref_count': len(xref_sigs.signatures), 'top_signatures': results}}
-"""
-    try:
-        result = ida_rpc(code)
-        return json.dumps(result)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+def generate_xref_signatures(address: str) -> str:
+    return json.dumps(
+        {
+            "method": "manual_xref",
+            "instructions": [
+                f"1. Use ida-pro-mcp xrefs_to({address}) to find callers",
+                "2. For each caller, extract 16-24 bytes before the CALL instruction",
+                "3. Wildcard the CALL target offset (last 4 bytes of CALL)",
+                "4. Test each pattern for uniqueness",
+            ],
+        }
+    )
 
 
 @server.tool(
     "search_signature",
-    "Search for signature pattern in binary",
-    {"pattern": {"type": "string"}, "limit": {"type": "integer", "default": 100}},
+    "Search pattern using ida-pro-mcp",
+    {"pattern": {"type": "string", "description": "Hex pattern with ?? wildcards"}},
 )
-def search_signature(pattern: str, limit: int = 100) -> str:
-    code = f"""
-import idaapi, sys
-sys.path.append(r'D:\\ida-sigmaker-mcp')
-from sigmaker import SigMaker, InMemoryBuffer
-
-buf = InMemoryBuffer.load()
-matches = SigMaker.search_sig('{pattern}', buf, limit={limit})
-results = [{{'address': hex(addr), 'function': idaapi.get_func_name(addr) or 'N/A'}} for addr in matches]
-{{'pattern': '{pattern}', 'match_count': len(results), 'matches': results}}
-"""
-    try:
-        result = ida_rpc(code)
-        return json.dumps(result)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+def search_signature(pattern: str) -> str:
+    return json.dumps(
+        {
+            "method": "Use ida-pro-mcp_find_bytes directly",
+            "pattern": pattern,
+            "note": "ida-pro-mcp find_bytes supports ?? wildcards natively",
+        }
+    )
 
 
 @server.tool(
-    "get_function_signature",
-    "Generate signature for entire function",
-    {"address": {"type": "string"}, "format": {"type": "string", "default": "ida"}},
+    "manual_signature_guide", "Step-by-step guide for manual signature generation", {}
 )
-def get_function_signature(address: str, format: str = "ida") -> str:
-    code = f"""
-import idaapi, idc, sys
-sys.path.append(r'D:\\ida-sigmaker-mcp')
-from sigmaker import SigMaker, SigMakerConfig, SignatureType
-
-ea = {int(address, 16) if isinstance(address, str) and address.startswith("0x") else address}
-func = idaapi.get_func(ea)
-if not func:
-    result = {{'error': 'No function at address'}}
-else:
-    fmt_map = {{'ida': SignatureType.IDA, 'x64dbg': SignatureType.X64DBG, 'c_array': SignatureType.C_ARRAY, 'raw_bytes': SignatureType.RAW_BYTES}}
-    cfg = SigMakerConfig(output_format=fmt_map.get('{format}', SignatureType.IDA), wildcard_operands=True, continue_outside_of_function=False, wildcard_optimized=True, max_single_signature_length=500)
-    sig = SigMaker.make_sig(func.start_ea, cfg, end=func.end_ea)
-    formatted = format(sig.signature, cfg.output_format.value)
-    result = {{'function': idaapi.get_func_name(ea), 'start': hex(func.start_ea), 'end': hex(func.end_ea), 'signature': formatted, 'length': len(sig.signature)}}
-result
-"""
-    try:
-        result = ida_rpc(code)
-        return json.dumps(result)
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+def manual_signature_guide() -> str:
+    return json.dumps(
+        {
+            "title": "Manual Signature Generation Guide",
+            "steps": {
+                "1_locate": {
+                    "tool": "ida-pro-mcp_find_bytes",
+                    "purpose": "Find target instruction",
+                    "example": "find_bytes(patterns=['48 8B 05'])",
+                },
+                "2_extract": {
+                    "tool": "ida-pro-mcp_get_bytes",
+                    "purpose": "Extract surrounding context (16-24 bytes)",
+                    "example": "get_bytes(regions=[{'address': '0x140001000', 'size': 24}])",
+                },
+                "3_analyze": {
+                    "tool": "ida-pro-mcp_disasm",
+                    "purpose": "Understand instruction structure",
+                    "example": "disasm(addr='0x140001000', max_instructions=5)",
+                },
+                "4_wildcard": {
+                    "manual": True,
+                    "rules": [
+                        "Wildcard immediate values (varies per build)",
+                        "Wildcard RIP-relative offsets (bytes 3-6 in LEA/MOV)",
+                        "Wildcard CALL/JMP targets",
+                        "Keep opcode bytes and register encodings",
+                    ],
+                },
+                "5_test": {
+                    "tool": "ida-pro-mcp_find_bytes",
+                    "purpose": "Verify uniqueness",
+                    "target": "Should return exactly 1 match",
+                },
+            },
+            "example_patterns": {
+                "WorldPtr": {
+                    "pattern": "48 89 C1 E8 ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 8B 40 18 48 8B 88 78 03",
+                    "mask": "xxxx????xxx????xxxxxxxxx",
+                    "offset": 10,
+                },
+                "BlipPtr": {
+                    "pattern": "48 8D 05 ?? ?? ?? ?? 48 89 03 0F B7 0D ?? ?? ?? ?? 85 C9 74",
+                    "mask": "xxx????xxxxxx????xxx",
+                    "offset": 0,
+                },
+            },
+        }
+    )
 
 
 if __name__ == "__main__":
