@@ -31,16 +31,18 @@ class MCPServer:
 
     def handle_request(self, request: dict) -> dict:
         method = request.get("method")
+        req_id = request.get("id")
 
         if method == "initialize":
-            return {
+            result = {
                 "protocolVersion": "2024-11-05",
                 "serverInfo": {"name": self.name, "version": self.version},
                 "capabilities": {"tools": {}},
             }
+            return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
         elif method == "tools/list":
-            return {
+            result = {
                 "tools": [
                     {
                         "name": n,
@@ -53,16 +55,29 @@ class MCPServer:
                     for n, i in self.tools.items()
                 ]
             }
+            return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
         elif method == "tools/call":
             tool_name = request["params"]["name"]
             args = request["params"].get("arguments", {})
             if tool_name not in self.tools:
-                raise ValueError(f"Unknown tool: {tool_name}")
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32602, "message": f"Unknown tool: {tool_name}"},
+                }
             result = self.tools[tool_name]["handler"](**args)
-            return {"content": [{"type": "text", "text": str(result)}]}
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {"content": [{"type": "text", "text": str(result)}]},
+            }
 
-        return {"error": "Unknown method"}
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": "Method not found"},
+        }
 
     def start(self):
         for line in sys.stdin:
