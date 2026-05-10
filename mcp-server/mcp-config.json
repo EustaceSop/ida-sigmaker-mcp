@@ -2,10 +2,7 @@
   "mcpServers": {
     "ida-sigmaker": {
       "command": "python",
-      "args": ["D:\\Download\\ida-sigmaker-main\\mcp-server\\sigmaker_mcp.py"],
-      "env": {
-        "PYTHONPATH": "D:\\Download\\ida-sigmaker-main\\src"
-      }
+      "args": ["D:\\ida-sigmaker-mcp\\mcp-server\\sigmaker_mcp.py"]
     }
   }
 }
