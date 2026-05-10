@@ -1,6 +1,6 @@
 # IDA SigMaker MCP Server
 
-將 IDA SigMaker 功能暴露給 LLM 智能體的 Model Context Protocol (MCP) 服務器。
+將 IDA SigMaker 功能暴露給 LLM 智能體的 Model Context Protocol (MCP) 服務器。由我(此指該帳號/項目擁有者GayBottle)及Claude Opus 4.7製作。
 
 ## 功能
 
