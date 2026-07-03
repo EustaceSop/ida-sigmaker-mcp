@@ -17,6 +17,7 @@ import os
 import pathlib
 import re
 import string
+import threading
 import time
 import traceback
 import typing
@@ -389,6 +390,81 @@ class CheckContinuePrompt:
         return self.enable_prompt
 
 
+@dataclasses.dataclass
+class TimeBudgetReporter:
+    """Non-interactive progress reporter with a wall-clock deadline.
+
+    Signals cancellation when either:
+        * elapsed_time >= time_budget_seconds (when > 0), or
+        * an externally-provided cancel_event is set, or
+        * IDA's built-in cancel button (wait-box) was clicked.
+
+    Never shows a modal prompt — safe to use from scripted/MCP contexts
+    where no human can respond to `ask_yn`.
+    """
+
+    time_budget_seconds: float = 0.0
+    cancel_event: typing.Optional[threading.Event] = None
+    logger: typing.Optional[logging.Logger] = None
+
+    _start_time: float = dataclasses.field(init=False, default=0.0)
+    _canceled: bool = dataclasses.field(init=False, default=False)
+    _progress_message: typing.Optional[str] = dataclasses.field(default=None, init=False, repr=False)
+    _dynamic_metadata: dict[str, typing.Any] = dataclasses.field(
+        default_factory=dict, init=False, repr=False
+    )
+
+    def __post_init__(self) -> None:
+        self._start_time = time.time()
+
+    @property
+    def elapsed_time(self) -> float:
+        return time.time() - self._start_time
+
+    def report_progress(
+        self,
+        *,
+        message: typing.Optional[str] = None,
+        metadata: typing.Optional[dict[str, typing.Any]] = None,
+        **metadata_kwargs,
+    ) -> None:
+        if metadata:
+            self._dynamic_metadata.update(metadata)
+        if metadata_kwargs:
+            self._dynamic_metadata.update(metadata_kwargs)
+        if message is not None:
+            self._progress_message = message
+
+    def should_cancel(self) -> bool:
+        if self._canceled:
+            return True
+        # Wall-clock budget check
+        if self.time_budget_seconds > 0 and self.elapsed_time >= self.time_budget_seconds:
+            self._canceled = True
+            if self.logger is not None:
+                self.logger.info(
+                    "Time budget exceeded (%.2fs >= %.2fs) — signaling cancel",
+                    self.elapsed_time,
+                    self.time_budget_seconds,
+                )
+            return True
+        # External cancel signal (used to interrupt from another thread)
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            self._canceled = True
+            return True
+        # Also honor the IDA cancel button (if a wait box is showing)
+        try:
+            if idaapi_user_canceled():
+                self._canceled = True
+                return True
+        except BaseException:
+            pass
+        return False
+
+    def enabled(self) -> bool:
+        return True
+
+
 class Unexpected(Exception):
     """Exception type used throughout the module to indicate unexpected errors."""
 
@@ -558,6 +634,76 @@ class InMemoryBuffer:
         return ida_addr - self.imagebase
 
 
+# ---------------------------------------------------------------------------
+# Module-level cache for InMemoryBuffer.
+#
+# Rationale: SignatureSearcher.is_unique() is called inside the signature-growth
+# hot loop (once per instruction appended). Each call previously invoked
+# InMemoryBuffer.load(SEGMENTS), which walks every segment and calls
+# idaapi.get_bytes() — on a large image (e.g. 200 MB) that is measured in
+# seconds and is repeated N times per signature. Caching by
+# (input file path, segment layout, image base) keeps the buffer alive across
+# is_unique() calls and reduces the O(N*image_size) reload cost to O(image_size)
+# once per session (or whenever segments change).
+# ---------------------------------------------------------------------------
+_BUFFER_CACHE: dict = {}
+_BUFFER_CACHE_LOCK = threading.RLock()
+
+
+def _current_segment_signature() -> tuple:
+    """Cheap fingerprint of the current segment layout.
+
+    Segment count, per-seg start/end/size — if any of these change we must
+    rebuild the cached buffer because the byte content or address mapping
+    is potentially different.
+    """
+    sig = []
+    seg = idaapi.get_first_seg()
+    while seg:
+        sig.append((int(seg.start_ea), int(seg.end_ea)))
+        seg = idaapi.get_next_seg(seg.start_ea)
+    return tuple(sig)
+
+
+def _get_cached_buffer(mode: "InMemoryBuffer.LoadMode" = InMemoryBuffer.LoadMode.SEGMENTS) -> "InMemoryBuffer":
+    """Return a cached InMemoryBuffer, building one on cache miss.
+
+    The wait box is only shown on a real (miss) load; cache hits are silent
+    which avoids flashing the wait box on every is_unique() iteration.
+    """
+    key = (idaapi.get_input_file_path() or "", mode)
+    with _BUFFER_CACHE_LOCK:
+        cached = _BUFFER_CACHE.get(key)
+        if cached is not None:
+            base_now = idaapi.get_imagebase()
+            seg_sig_now = _current_segment_signature()
+            if cached["base"] == base_now and cached["seg_sig"] == seg_sig_now:
+                return cached["buf"]
+        # Cache miss — build fresh buffer (show wait box for user feedback)
+        try:
+            idaapi.show_wait_box("HIDECANCEL\nCaching binary buffer for signature search...")
+            buf = InMemoryBuffer.load(mode=mode)
+        finally:
+            with contextlib.suppress(BaseException):
+                idaapi.hide_wait_box()
+        _BUFFER_CACHE[key] = {
+            "buf": buf,
+            "base": idaapi.get_imagebase(),
+            "seg_sig": _current_segment_signature(),
+        }
+        return buf
+
+
+def invalidate_buffer_cache() -> None:
+    """Public helper: drop all cached InMemoryBuffer instances.
+
+    Call after any operation that mutates the loaded segments (rebase,
+    reanalyze, database reload, patch bytes into a scanned segment).
+    """
+    with _BUFFER_CACHE_LOCK:
+        _BUFFER_CACHE.clear()
+
+
 @dataclasses.dataclass
 class SigMakerConfig:
     """Configuration for SigMaker operations.
@@ -576,6 +722,13 @@ class SigMakerConfig:
     max_single_signature_length: int = 100
     max_xref_signature_length: int = 250
     prompt_interval: int = 10  # Seconds before first prompt (default: 10 for testing)
+    # Wall-clock deadline for signature generation. 0.0 disables the deadline
+    # (legacy/interactive behavior). MCP/scripted callers should set this to a
+    # positive value (e.g. 15.0) so the hot loop bails out instead of hanging.
+    time_budget_seconds: float = 0.0
+    # When True, no modal dialogs (ask_yn, continue prompts) will be shown.
+    # Forced by the MCP layer where there is no human to answer prompts.
+    noninteractive: bool = False
 
 
 @dataclasses.dataclass(slots=True, frozen=True, repr=False)
@@ -1283,13 +1436,17 @@ class UniqueSignatureGenerator:
         start_fn = idaapi.get_func(ea)
         bytes_since_last_check = 0
         instruction_count = 0
+        noninteractive = getattr(cfg, "noninteractive", False)
 
         for cur_ea, ins, ins_len in InstructionWalker(ea):
-            # Check for cancellation via progress reporter
+            # Check for cancellation via progress reporter (wall-clock budget,
+            # external cancel event, or IDA cancel button).
             if self.progress_reporter is not None and self.progress_reporter.should_cancel():
                 raise UserCanceledError("Signature generation canceled by user")
 
-            # Update progress periodically
+            # Update progress + yield to the IDA UI periodically so auto-analysis
+            # and user cancels can make progress. qsleep(0) is a no-op wait that
+            # pumps the Qt event loop.
             instruction_count += 1
             progress_reporting = self.progress_reporter is not None and self.progress_reporter.enabled()
             if progress_reporting and instruction_count % 100 == 0:
@@ -1298,12 +1455,17 @@ class UniqueSignatureGenerator:
                     signature_length=len(sig),
                     instructions_processed=instruction_count,
                 )
+            if instruction_count % 64 == 0:
+                with contextlib.suppress(BaseException):
+                    idaapi.qsleep(0)
 
             # Check length constraint
             if bytes_since_last_check > cfg.max_single_signature_length:
+                # Scripted / MCP callers must never trigger a modal prompt.
+                if noninteractive or not cfg.ask_longer_signature:
+                    raise Unexpected("Signature not unique within length constraints")
                 if (
-                    not cfg.ask_longer_signature
-                    or idaapi.ask_yn(
+                    idaapi.ask_yn(
                         idaapi.ASKBTN_NO,
                         f"Signature is already {len(sig)} bytes. Continue?",
                     )
@@ -1391,6 +1553,9 @@ class RangeSignatureGenerator:
                     instructions_processed=instruction_count,
                     progress_percent=f"{progress_pct:.1f}%",
                 )
+            if instruction_count % 64 == 0:
+                with contextlib.suppress(BaseException):
+                    idaapi.qsleep(0)
 
             self.processor.append_instruction_to_sig(
                 sig, cur_ea, ins, cfg.wildcard_operands, cfg.wildcard_optimized
@@ -1481,23 +1646,42 @@ class SignatureMaker:
         if start_ea == idaapi.BADADDR:
             raise Unexpected("Invalid start address")
 
-        # Create progress reporter based on config if not provided
+        # Create progress reporter based on config if not provided.
+        #
+        # Choice matrix:
+        #  * time_budget_seconds > 0 OR noninteractive → TimeBudgetReporter
+        #    (bounded wall-clock, never prompts — safe for MCP/scripted callers)
+        #  * otherwise → CheckContinuePrompt (legacy interactive behavior)
         if not progress_reporter:
-            progress_reporter = CheckContinuePrompt(
-                prompt_interval=cfg.prompt_interval,
-                metadata={
-                    "operation": "Signature generation",
-                    "start_address": hex(start_ea),
-                },
-                logger=LOGGER,
-                enable_prompt=cfg.enable_continue_prompt,
-            )
-            if DEBUGGING_MODE:
-                LOGGER.info(
-                    "Created CheckContinuePrompt: interval=%ds, enabled=%s",
-                    cfg.prompt_interval,
-                    cfg.enable_continue_prompt,
+            noninteractive = getattr(cfg, "noninteractive", False)
+            budget = float(getattr(cfg, "time_budget_seconds", 0.0) or 0.0)
+            if noninteractive or budget > 0:
+                progress_reporter = TimeBudgetReporter(
+                    time_budget_seconds=budget,
+                    logger=LOGGER,
                 )
+                if DEBUGGING_MODE:
+                    LOGGER.info(
+                        "Created TimeBudgetReporter: budget=%.2fs, noninteractive=%s",
+                        budget,
+                        noninteractive,
+                    )
+            else:
+                progress_reporter = CheckContinuePrompt(
+                    prompt_interval=cfg.prompt_interval,
+                    metadata={
+                        "operation": "Signature generation",
+                        "start_address": hex(start_ea),
+                    },
+                    logger=LOGGER,
+                    enable_prompt=cfg.enable_continue_prompt,
+                )
+                if DEBUGGING_MODE:
+                    LOGGER.info(
+                        "Created CheckContinuePrompt: interval=%ds, enabled=%s",
+                        cfg.prompt_interval,
+                        cfg.enable_continue_prompt,
+                    )
 
         if end is None:
             # Create unique signature generator via factory method
@@ -1547,13 +1731,30 @@ class XrefFinder:
         if total == 0:
             return XrefGeneratedSignature([])
 
-        # Non-interactive during xref search
+        # Non-interactive during xref search — no ask_yn prompts inside the
+        # per-xref sig generation. Also carry through the noninteractive flag
+        # so per-xref calls behave the same as the outer request.
         cfg_no_prompt = dataclasses.replace(cfg, ask_longer_signature=False)
+
+        # Overall wall-clock deadline shared by every per-xref generation. If
+        # the caller supplied a budget, split it fairly: each per-xref call
+        # gets the remaining time (not a fixed per-xref slice), which lets an
+        # easy xref finish fast and leave more time for the tricky ones.
+        overall_budget = float(getattr(cfg, "time_budget_seconds", 0.0) or 0.0)
+        noninteractive = getattr(cfg, "noninteractive", False)
+        deadline = time.time() + overall_budget if overall_budget > 0 else None
 
         shortest_len = cfg.max_xref_signature_length + 1
 
         for i, frm_ea in enumerate(self.iter_code_xrefs_to(ea), start=1):
             if self.progress_dialog.user_canceled():
+                break
+
+            # Enforce overall wall-clock deadline
+            if deadline is not None and time.time() >= deadline:
+                LOGGER.info(
+                    "XREF search time budget exhausted after %d/%d xrefs", i - 1, total
+                )
                 break
 
             self.progress_dialog.replace_message(
@@ -1562,9 +1763,21 @@ class XrefFinder:
                 f"Shortest Signature: {shortest_len if shortest_len <= cfg.max_xref_signature_length else 0} Bytes"
             )
 
+            # Per-xref time slice = remaining budget
+            per_xref_cfg = cfg_no_prompt
+            if deadline is not None:
+                remaining = max(0.5, deadline - time.time())
+                per_xref_cfg = dataclasses.replace(
+                    cfg_no_prompt,
+                    time_budget_seconds=remaining,
+                    noninteractive=True,
+                )
+            elif noninteractive:
+                per_xref_cfg = dataclasses.replace(cfg_no_prompt, noninteractive=True)
+
             try:
                 # Public API: returns SignatureResult
-                result = self.signature_maker.make_signature(frm_ea, cfg_no_prompt)
+                result = self.signature_maker.make_signature(frm_ea, per_xref_cfg)
                 sig: typing.Optional[Signature] = result.signature
             except Exception:
                 sig = None
@@ -1737,17 +1950,16 @@ class SignatureSearcher:
         ida_signature: str, skip_more_than_one: bool = False
     ) -> list[Match]:
         simd_signature, _ = SigText.normalize(ida_signature)
-        with ProgressDialog("Please stand by, copying segments..."):
-            buf = InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.SEGMENTS)
+        # Use cached buffer instead of reloading on every call. The cache keys
+        # off segment layout + image base so it invalidates automatically when
+        # the DB changes. Silent on cache hit (no wait-box flash per is_unique).
+        buf = _get_cached_buffer(InMemoryBuffer.LoadMode.SEGMENTS)
         data_mv = buf.data()
         LOGGER.debug(
-            "searching for",
+            "searching for %s starting from %s size=%s buf_len=%d",
             simd_signature,
-            "starting from",
             hex(buf.imagebase),
-            "with size",
             hex(buf.file_size),
-            "buf length:",
             len(data_mv),
         )
 
@@ -1759,11 +1971,17 @@ class SignatureSearcher:
 
         n = len(data_mv)
         off = 0
+        loop_count = 0
         while off <= n - k:
-            # Check for user cancellation
-            if idaapi_user_canceled():
-                LOGGER.info("Search canceled by user")
-                break
+            loop_count += 1
+            # Check for user cancellation less often (every 8 iters) — the
+            # is_key_pressed call has cost. Also pump the Qt event loop.
+            if loop_count % 8 == 0:
+                if idaapi_user_canceled():
+                    LOGGER.info("Search canceled by user")
+                    break
+                with contextlib.suppress(BaseException):
+                    idaapi.qsleep(0)
 
             idx = _simd_scan_bytes(data_mv[off:], sig)
             if idx < 0:
@@ -1776,10 +1994,10 @@ class SignatureSearcher:
         return results
 
     @staticmethod
-    def find_all(ida_signature: str) -> list[Match]:
-        # Use SIMD if available
-        if SIMD_SPEEDUP_AVAILABLE:
-            return SignatureSearcher._find_all_simd(ida_signature)
+    def _find_all_ida(
+        ida_signature: str, max_matches: typing.Optional[int] = None
+    ) -> list[Match]:
+        """Fallback (non-SIMD) find_all with optional short-circuit on N matches."""
         binary = idaapi.compiled_binpat_vec_t()
         idaapi.parse_binpat_str(binary, idaapi.inf_get_min_ea(), ida_signature, 16)
         out: list[Match] = []
@@ -1787,11 +2005,18 @@ class SignatureSearcher:
         _bin_search = getattr(idaapi, "bin_search", None) or getattr(
             idaapi, "bin_search3"
         )
+        loop_count = 0
         while True:
-            # Check for user cancellation
-            if idaapi_user_canceled():
-                LOGGER.info("Search canceled by user")
-                break
+            loop_count += 1
+            # Poll cancel + pump UI every 4 hits (bin_search itself is a
+            # long syscall so we can't yield inside it, but between calls
+            # gives IDA some breathing room).
+            if loop_count % 4 == 0:
+                if idaapi_user_canceled():
+                    LOGGER.info("Search canceled by user")
+                    break
+                with contextlib.suppress(BaseException):
+                    idaapi.qsleep(0)
 
             hit, _ = _bin_search(
                 ea,
@@ -1802,12 +2027,31 @@ class SignatureSearcher:
             if hit == idaapi.BADADDR:
                 break
             out.append(Match(hit))
+            if max_matches is not None and len(out) >= max_matches:
+                break
             ea = hit + 1
         return out
 
+    @staticmethod
+    def find_all(ida_signature: str) -> list[Match]:
+        # Use SIMD if available
+        if SIMD_SPEEDUP_AVAILABLE:
+            return SignatureSearcher._find_all_simd(ida_signature)
+        return SignatureSearcher._find_all_ida(ida_signature)
+
     @classmethod
     def is_unique(cls, ida_signature: str) -> bool:
-        return len(cls.find_all(ida_signature)) == 1
+        """Return True iff there is exactly one occurrence of the signature.
+
+        Uses the 2-match short-circuit so we stop scanning as soon as we know
+        the answer — no need to enumerate every match across the whole image
+        when we only care about "is count == 1".
+        """
+        if SIMD_SPEEDUP_AVAILABLE:
+            matches = cls._find_all_simd(ida_signature, skip_more_than_one=True)
+        else:
+            matches = cls._find_all_ida(ida_signature, max_matches=2)
+        return len(matches) == 1
 
 
 # no cover: start
